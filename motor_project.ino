@@ -31,6 +31,8 @@ const unsigned long AVERAGE_MS = 3000; // then average for this long
 const float MAX_CURRENT_A = 14.0; // INA260 is rated for 15 A
 const unsigned long LOADCELL_TIMEOUT_MS = 1000;
 
+const uint8_t INA260_ADDR = 0x40; // default address (A0 and A1 jumpers open)
+
 // Calibration storage
 const uint32_t CAL_MAGIC = 0xCA1B0001;
 
@@ -46,6 +48,7 @@ float calFactor = 1.0;
 float pct = 0;
 long tareRaw = 0;
 unsigned long lastSampleMs = 0;
+unsigned long lastWarnMs = 0;
 
 // Sweep state
 bool sweeping = false;
@@ -69,6 +72,15 @@ void stopMotor(const char *reason) {
   sweeping = false;
   Serial.print("# stopped: ");
   Serial.println(reason);
+}
+
+// True if the HX711 delivers a sample within the timeout
+bool loadcellAlive() {
+  unsigned long start = millis();
+  while (!loadcell.is_ready()) {
+    if (millis() - start > LOADCELL_TIMEOUT_MS) return false;
+  }
+  return true;
 }
 
 void tare() {
@@ -117,8 +129,16 @@ void handleSerial() {
     return;
   }
 
+  // t, k and s read the load cell, which would wait forever on a dead HX711
+  if ((c == 't' || c == 'k' || c == 's') && pct == 0 && !loadcellAlive()) {
+    Serial.println("# load cell not answering - command ignored");
+    return;
+  }
+
   if (c == 'p') {
     setThrottle(Serial.parseFloat());
+    Serial.print("# throttle=");
+    Serial.println(pct, 1);
   } else if (c == 't' && pct == 0) {
     tare();
   } else if (c == 'k' && pct == 0) {
@@ -152,10 +172,20 @@ void setup() {
   // serial communication
   Serial.begin(115200);
   Serial.setTimeout(100);
+  Serial.println("# boot");
 
-  // Start sensors
+  // Start sensors. The timeout stops a stuck I2C bus from freezing the sketch,
+  // and the wait loop keeps reporting until the INA260 answers.
+  Wire.begin();
+  Wire.setWireTimeout(25000, true);
+  while (true) {
+    Wire.beginTransmission(INA260_ADDR);
+    if (Wire.endTransmission() == 0) break;
+    Serial.println("# INA260 not answering - check Vcc->5V, GND->GND, SDA->A4, SCL->A5");
+    delay(1000);
+  }
   if (!ina.begin()) {
-    Serial.println("# INA260 not found - check Vcc/GND/SDA/SCL");
+    Serial.println("# INA260 answered but failed to start - halted");
     while (true) {}
   }
   // Average 16 samples (~35 ms) so ESC switching ripple doesn't land in single readings
@@ -186,8 +216,12 @@ void loop() {
   // Only act when the load cell has a new sample, so a dead HX711
   // can't block the loop and lock out the stop command
   if (!loadcell.is_ready()) {
-    if (pct > 0 && millis() - lastSampleMs > LOADCELL_TIMEOUT_MS) {
-      stopMotor("load cell timeout");
+    if (millis() - lastSampleMs > LOADCELL_TIMEOUT_MS) {
+      if (pct > 0) stopMotor("load cell timeout");
+      if (millis() - lastWarnMs > 1000) {
+        lastWarnMs = millis();
+        Serial.println("# load cell not answering - check HX711 DAT->D2, CLK->D3, power");
+      }
     }
     return;
   }
